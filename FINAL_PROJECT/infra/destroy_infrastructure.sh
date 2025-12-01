@@ -5,7 +5,7 @@ if [ ! -f "./config.sh" ]; then
   echo "ERROR: infra/config.sh not found."
   exit 1
 fi
-source ./config.sh
+source config.txt
 source ./cloudwatch_utils.sh
 
 log_to_cw "Destroying infrastructure..."

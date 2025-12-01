@@ -1,181 +1,184 @@
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")"
-# load config and utils
-if [ ! -f "./config.sh" ]; then
-  echo "ERROR: infra/config.sh not found. Create it from the template."
-  exit 1
-fi
-source ./config.sh
-source ./cloudwatch_utils.sh
-
-log_to_cw "=== Creating Infrastructure ==="
-
-# Tagging helper
-tag_args=(--tag-specifications "ResourceType=vpc,Tags=[{Key=${PROJECT_TAG_KEY},Value=${PROJECT_TAG_VALUE}}]")
-
-# 1) Create S3 bucket (idempotent)
-log_to_cw "Creating S3 bucket: $RESUME_BUCKET_NAME"
-if aws s3api head-bucket --bucket "$RESUME_BUCKET_NAME" 2>/dev/null; then
-  log_to_cw "Bucket already exists: $RESUME_BUCKET_NAME"
-else
-  if [ "$REGION" = "us-east-1" ]; then
-    aws s3api create-bucket --bucket "$RESUME_BUCKET_NAME" --region "$REGION"
-  else
-    aws s3api create-bucket --bucket "$RESUME_BUCKET_NAME" --region "$REGION" \
-      --create-bucket-configuration LocationConstraint="$REGION"
-  fi
-  log_to_cw "Bucket created: $RESUME_BUCKET_NAME"
-fi
-
-# 2) Create VPC (idempotent)
-log_to_cw "Creating VPC with CIDR $VPC_CIDR"
-VPC_EXISTING=$(aws ec2 describe-vpcs --filters "Name=tag:${PROJECT_TAG_KEY},Values=${PROJECT_TAG_VALUE}" --region "$REGION" --query 'Vpcs[0].VpcId' --output text 2>/dev/null || echo "")
-if [ -n "$VPC_EXISTING" ] && [ "$VPC_EXISTING" != "None" ]; then
-  VPC_ID="$VPC_EXISTING"
-  log_to_cw "Found existing VPC: $VPC_ID"
-else
-  VPC_ID=$(aws ec2 create-vpc --cidr-block "$VPC_CIDR" --region "$REGION" --query 'Vpc.VpcId' --output text)
-  aws ec2 create-tags --resources "$VPC_ID" --tags Key="${PROJECT_TAG_KEY}",Value="${PROJECT_TAG_VALUE}" --region "$REGION"
-  aws ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-support "{\"Value\":true}" --region "$REGION" || true
-  aws ec2 modify-vpc-attribute --vpc-id "$VPC_ID" --enable-dns-hostnames "{\"Value\":true}" --region "$REGION" || true
-  log_to_cw "VPC created: $VPC_ID"
-fi
-echo "$VPC_ID" > vpc_id.txt
-
-# 3) Create Subnets
-create_subnet_if_missing() {
-  local cidr=$1; local az=$2
-  # check if a subnet with this CIDR in the project exists
-  existing=$(aws ec2 describe-subnets --filters "Name=cidr-block,Values=$cidr" "Name=vpc-id,Values=$VPC_ID" --region "$REGION" --query 'Subnets[0].SubnetId' --output text 2>/dev/null || echo "")
-  if [ -n "$existing" ] && [ "$existing" != "None" ]; then
-    echo "$existing"
-  else
-    id=$(aws ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block "$cidr" --availability-zone "$az" --region "$REGION" --query 'Subnet.SubnetId' --output text)
-    aws ec2 create-tags --resources "$id" --tags Key="${PROJECT_TAG_KEY}",Value="${PROJECT_TAG_VALUE}" --region "$REGION"
-    echo "$id"
-  fi
-}
-AZ1="${REGION}a"
-AZ2="${REGION}b"
-SUBNET1=$(create_subnet_if_missing "$SUBNET_CIDR_1" "$AZ1")
-SUBNET2=$(create_subnet_if_missing "$SUBNET_CIDR_2" "$AZ2")
-log_to_cw "Subnets in VPC: $SUBNET1, $SUBNET2"
-
-# 4) Internet Gateway
-IGW_ID=$(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC_ID" --region "$REGION" --query 'InternetGateways[0].InternetGatewayId' --output text 2>/dev/null || echo "")
-if [ -z "$IGW_ID" ] || [ "$IGW_ID" = "None" ]; then
-  IGW_ID=$(aws ec2 create-internet-gateway --region "$REGION" --query 'InternetGateway.InternetGatewayId' --output text)
-  aws ec2 attach-internet-gateway --internet-gateway-id "$IGW_ID" --vpc-id "$VPC_ID" --region "$REGION"
-  aws ec2 create-tags --resources "$IGW_ID" --tags Key="${PROJECT_TAG_KEY}",Value="${PROJECT_TAG_VALUE}" --region "$REGION"
-  log_to_cw "Created & attached IGW: $IGW_ID"
-else
-  log_to_cw "Found existing IGW: $IGW_ID"
-fi
-
-# 5) Route Table + Route to IGW
-RTB_ID=$(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC_ID" --region "$REGION" --query 'RouteTables[0].RouteTableId' --output text)
-if [ -z "$RTB_ID" ] || [ "$RTB_ID" = "None" ]; then
-  RTB_ID=$(aws ec2 create-route-table --vpc-id "$VPC_ID" --region "$REGION" --query 'RouteTable.RouteTableId' --output text)
-  aws ec2 create-tags --resources "$RTB_ID" --tags Key="${PROJECT_TAG_KEY}",Value="${PROJECT_TAG_VALUE}" --region "$REGION"
-  log_to_cw "Created route table: $RTB_ID"
-fi
-# create route (ignore error if exists)
-aws ec2 create-route --route-table-id "$RTB_ID" --destination-cidr-block 0.0.0.0/0 --gateway-id "$IGW_ID" --region "$REGION" 2>/dev/null || true
-# associate subnets
-aws ec2 associate-route-table --route-table-id "$RTB_ID" --subnet-id "$SUBNET1" --region "$REGION" 2>/dev/null || true
-aws ec2 associate-route-table --route-table-id "$RTB_ID" --subnet-id "$SUBNET2" --region "$REGION" 2>/dev/null || true
-log_to_cw "Route table associated with subnets"
-
-# 6) Security Group
-# Allow SSH only from your IP and HTTP from anywhere (change as needed)
-MY_IP=$(curl -s ifconfig.me || echo "0.0.0.0")
-MY_CIDR="${MY_IP}/32"
-SG_EXISTING=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=$SECURITY_GROUP_NAME" "Name=vpc-id,Values=$VPC_ID" --region "$REGION" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "")
-if [ -n "$SG_EXISTING" ] && [ "$SG_EXISTING" != "None" ]; then
-  SG_ID="$SG_EXISTING"
-  log_to_cw "Found existing SG: $SG_ID"
-else
-  SG_ID=$(aws ec2 create-security-group --group-name "$SECURITY_GROUP_NAME" --description "$SECURITY_GROUP_DESC" --vpc-id "$VPC_ID" --region "$REGION" --query 'GroupId' --output text)
-  aws ec2 create-tags --resources "$SG_ID" --tags Key="${PROJECT_TAG_KEY}",Value="${PROJECT_TAG_VALUE}" --region "$REGION"
-  log_to_cw "Created SG: $SG_ID"
-fi
-# try to authorize (ignore failure if rule exists)
-aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22 --cidr "$MY_CIDR" --region "$REGION" 2>/dev/null || true
-aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 80 --cidr "0.0.0.0/0" --region "$REGION" 2>/dev/null || true
-aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 5000 --cidr "0.0.0.0/0" --region "$REGION" 2>/dev/null || true
-
-# save SG
-echo "$SG_ID" > sg_id.txt
-
-# 7) Key pair (create locally if not exists)
-if [ ! -f "$KEY_FILE" ] && [ "${CREATE_KEYPAIR:-false}" = true ]; then
-  log_to_cw "Creating key pair $KEY_NAME and saving to $KEY_FILE"
-  aws ec2 create-key-pair --key-name "$KEY_NAME" --key-type "$KEY_TYPE" --region "$REGION" --query 'KeyMaterial' --output text > "$KEY_FILE"
-  chmod 400 "$KEY_FILE"
-else
-  log_to_cw "Key file exists or CREATE_KEYPAIR disabled"
-fi
-
-# 8) Launch EC2 instance (idempotent: launches a new one and appends to instance_id.txt)
-log_to_cw "Preparing user-data and launching EC2 instance"
-
-read -r -d '' USER_DATA <<'EOF' || true
 #!/bin/bash
 set -e
-# Basic bootstrap for Ubuntu 22.04/20.04
-apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip git nginx
-# Create app directory
-APP_DIR=/home/ubuntu/resume-app
-mkdir -p $APP_DIR
-chown -R ubuntu:ubuntu $APP_DIR
+source config.txt
+source cloudwatch_utils.sh
 
-# Clone repo (placeholder - change to your repo)
-if [ ! -d /home/ubuntu/resume-app-source ]; then
-  sudo -u ubuntu git clone https://github.com/your-username/Vikas.git /home/ubuntu/resume-app-source || true
-else
-  cd /home/ubuntu/resume-app-source && sudo -u ubuntu git pull || true
+log_to_cw "=== Creating Infrastructure ==="
+echo "=== Starting infrastructure creation ==="
+
+# ----------------------------
+# Create S3 Bucket
+# ----------------------------
+if [ -z "$RESUME_BUCKET_NAME" ]; then
+    RESUME_BUCKET_NAME="resume-parser-$(whoami)-$(date +%s)"
 fi
+echo "Using S3 bucket name: $RESUME_BUCKET_NAME"
 
-# Move API folder into place (adjust paths if your repo differs)
-cp -r /home/ubuntu/resume-app-source/api $APP_DIR/
-cp -r /home/ubuntu/resume-app-source/frontend $APP_DIR/
+aws s3api create-bucket --bucket "$RESUME_BUCKET_NAME" --region "$REGION" \
+    --create-bucket-configuration LocationConstraint="$REGION" 2>/dev/null || true
+log_to_cw "S3 bucket ready: $RESUME_BUCKET_NAME"
 
-cd $APP_DIR/api || exit 0
-pip3 install --upgrade pip
-pip3 install -r requirements.txt || true
+# ----------------------------
+# VPC
+# ----------------------------
+VPC_ID=$(aws ec2 create-vpc --cidr-block "$VPC_CIDR" --region "$REGION" \
+    --query "Vpc.VpcId" --output text)
+echo "$VPC_ID" > vpc_id.txt
+log_to_cw "VPC created: $VPC_ID"
 
-# set env for S3 bucket
-echo "export RESUME_BUCKET_NAME=${RESUME_BUCKET_NAME}" > /etc/profile.d/resume_app.sh
+# ----------------------------
+# Subnets
+# ----------------------------
+SUBNET1=$(aws ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block "$SUBNET_CIDR_1" \
+    --availability-zone "${REGION}a" --query "Subnet.SubnetId" --output text)
+SUBNET2=$(aws ec2 create-subnet --vpc-id "$VPC_ID" --cidr-block "$SUBNET_CIDR_2" \
+    --availability-zone "${REGION}b" --query "Subnet.SubnetId" --output text)
+log_to_cw "Subnets created: $SUBNET1, $SUBNET2"
 
-# start gunicorn under ubuntu user
-sudo -u ubuntu nohup gunicorn -w 2 -b 0.0.0.0:5000 app:app --chdir $APP_DIR/api > /var/log/resume_app_gunicorn.log 2>&1 &
+# ----------------------------
+# Internet Gateway & Route Table
+# ----------------------------
+IGW_ID=$(aws ec2 create-internet-gateway --region "$REGION" \
+    --query "InternetGateway.InternetGatewayId" --output text)
+aws ec2 attach-internet-gateway --vpc-id "$VPC_ID" --internet-gateway-id "$IGW_ID" --region "$REGION"
+log_to_cw "Internet Gateway attached: $IGW_ID"
+
+RTB_ID=$(aws ec2 create-route-table --vpc-id "$VPC_ID" --region "$REGION" \
+    --query "RouteTable.RouteTableId" --output text)
+aws ec2 create-route --route-table-id "$RTB_ID" --destination-cidr-block 0.0.0.0/0 \
+    --gateway-id "$IGW_ID" --region "$REGION"
+aws ec2 associate-route-table --route-table-id "$RTB_ID" --subnet-id "$SUBNET1" --region "$REGION"
+aws ec2 associate-route-table --route-table-id "$RTB_ID" --subnet-id "$SUBNET2" --region "$REGION"
+
+# ----------------------------
+# Security Group
+# ----------------------------
+MY_IP=$(curl -s ifconfig.me)/32
+SG_ID=$(aws ec2 create-security-group --group-name "$SECURITY_GROUP_NAME" \
+    --description "$SECURITY_GROUP_DESC" --vpc-id "$VPC_ID" --region "$REGION" \
+    --query "GroupId" --output text)
+if [ -z "$SG_ID" ] || [ "$SG_ID" == "None" ]; then
+    echo "ERROR: Security Group creation failed"
+    exit 1
+fi
+echo "Security Group created: $SG_ID"
+
+aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 22 --cidr "$MY_IP" --region "$REGION"
+aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --protocol tcp --port 80 --cidr 0.0.0.0/0 --region "$REGION"
+
+# ----------------------------
+# Key Pair
+# ----------------------------
+KEY_FILE="/home/vagrant/${KEY_NAME}.pem"
+rm -f "$KEY_FILE"
+
+aws ec2 create-key-pair --key-name "$KEY_NAME" --key-type "$KEY_TYPE" --region "$REGION" \
+    --query "KeyMaterial" --output text > "$KEY_FILE"
+chmod 400 "$KEY_FILE"
+echo "Key pair saved to $KEY_FILE"
+
+# ----------------------------
+# AMI
+# ----------------------------
+echo "Searching for Ubuntu AMI..."
+AMI_ID="ami-03deb8c961063af8c"
+echo "Using AMI_ID: $AMI_ID"
+
+if [ -z "$AMI_ID" ] || [ "$AMI_ID" == "None" ]; then
+    echo "ERROR: No valid AMI found. Please check UBUNTU_FILTER, UBUNTU_OWNER, and REGION."
+    exit 1
+fi
+echo "Using AMI_ID: $AMI_ID"
+
+# ----------------------------
+# UserData for EC2
+# ----------------------------
+USER_DATA=$(cat <<'EOF'
+#!/bin/bash
+# Update and install packages
+sudo apt update -y
+sudo apt install -y python3-pip git nginx
+
+# Export S3 bucket name (used by Flask)
+export RESUME_BUCKET_NAME=YOUR_BUCKET_NAME
+
+# Go to home folder
+cd /home/ubuntu
+
+# Clone repo
+git clone https://github.com/ssamek/ITMO_444_FINAL_PROJECT.git resume-flask-api
+
+# Install Python dependencies
+cd /home/ubuntu/resume-flask-api
+pip3 install -r requirements.txt
+
+# Set up Nginx to proxy requests to Gunicorn
+sudo tee /etc/nginx/sites-available/resume-app > /dev/null <<'NGINXCONF'
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+NGINXCONF
+
+# Enable Nginx site
+sudo ln -s /etc/nginx/sites-available/resume-app /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t
+sudo systemctl restart nginx
+
+# Create systemd service for Flask app
+sudo tee /etc/systemd/system/resume-app.service > /dev/null <<'SERVICECONF'
+[Unit]
+Description=Gunicorn Resume App
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/resume-flask-api
+ExecStart=/usr/local/bin/gunicorn -b 0.0.0.0:5000 app:app
+
+[Install]
+WantedBy=multi-user.target
+SERVICECONF
+
+# Reload systemd, enable and start service
+sudo systemctl daemon-reload
+sudo systemctl enable resume-app
+sudo systemctl start resume-app
+
 EOF
+)
 
-INSTANCE_ID=$(aws ec2 run-instances \
-  --image-id "$AMI_ID" \
-  --instance-type "$INSTANCE_TYPE" \
-  --key-name "$KEY_NAME" \
-  --security-group-ids "$SG_ID" \
-  --subnet-id "$SUBNET1" \
-  --associate-public-ip-address \
-  --user-data "$USER_DATA" \
-  --region "$REGION" \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=${PROJECT_TAG_KEY},Value=${PROJECT_TAG_VALUE}}]" \
-  --query "Instances[0].InstanceId" --output text)
+# ----------------------------
+# Launch EC2
+# ----------------------------
+echo "Launching EC2 instance..."
+INSTANCE_ID=$(aws ec2 run-instances --image-id "$AMI_ID" --count 1 \
+    --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
+    --security-group-ids "$SG_ID" --subnet-id "$SUBNET1" \
+    --associate-public-ip-address \
+    --user-data "$USER_DATA" \
+    --region "$REGION" \
+    --query "Instances[0].InstanceId" --output text)
 
-if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
-  echo "ERROR: Failed to launch instance"
-  exit 1
+if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+    echo "ERROR: EC2 instance launch failed"
+    exit 1
 fi
 
 aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
-PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
-echo "$INSTANCE_ID" >> instance_id.txt
-echo "$PUBLIC_IP" >> instance_ip.txt
+PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+    --query "Reservations[0].Instances[0].PublicIpAddress" --output text --region "$REGION")
 
-log_to_cw "EC2 instance launched: $INSTANCE_ID ($PUBLIC_IP)"
+echo "$INSTANCE_ID" > instance_id.txt
+echo "$PUBLIC_IP" > instance_ip.txt
+log_to_cw "EC2 instance created: $INSTANCE_ID ($PUBLIC_IP)"
 send_cw_metric 1
 
-echo "=== create_infrastructure.sh completed ==="
+echo "=== Infrastructure creation completed successfully ==="
