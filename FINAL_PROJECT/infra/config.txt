@@ -1,0 +1,26 @@
+REGION=us-east-1
+AWS_REGION=us-east-1
+
+# Key pair
+KEY_NAME=my-key-pair
+KEY_TYPE=ed25519
+KEY_FILE=my-key-pair.pem
+
+# Networking
+VPC_CIDR=10.0.0.0/16
+SUBNET_CIDR_1=10.0.1.0/24
+SUBNET_CIDR_2=10.0.2.0/24
+SECURITY_GROUP_NAME=resume-sg
+SECURITY_GROUP_DESC="Resume Parser Security Group"
+
+# EC2
+INSTANCE_TYPE=t3.micro
+TAG_NAME=resume-parser
+INSTANCE_PROFILE_NAME=resume-parser-profile
+
+# S3 bucket
+RESUME_BUCKET_NAME=resume-bucket-samek12345
+
+# AMI
+UBUNTU_OWNER=099720109477
+UBUNTU_FILTER=ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*
